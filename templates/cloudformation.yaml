@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Data Optimizing Tools
+
+Parameters:
+
+  # s3
+  pS3BucketSourceData:
+    Type: String
+    Description: S3 - name of bucket containing source data
+    MinLength: '3'
+
+  pS3BucketArtifacts:
+    Type: String
+    Description: S3 - The S3 path where the scripts for the glue jobs are located (ex. "glue-scripts-1")
+    MinLength: '3'
+
+  pS3GlueTempBucket:
+    Type: String
+    Description: S3 - name of bucket for glue temp files (ex. "aws-glue-temporary-384988745299-us-east-1")
+
+# --------------------------------------------------
+# Parameters: Glue
+# --------------------------------------------------
+  pGlueDBName:
+    Type: String
+    Default: reddit_db
+    Description: Glue - name of glue database to create tables in
+    MinLength: '3'
+
+  pGlueDBSourceTable:
+    Type: String
+    Default: reddit_comments
+    Description: Glue - name of the table you'd like to optimize
+    MinLength: '3'
+
+  pIncludeDevEndpoint:
+    Type: String
+    Default: false
+    Description: Glue - boolean to deploy Glue Dev Endpoint for testing spark jobs - WARNING! This is expensive to run
+    AllowedValues:
+      - true
+      - false
+
+# --------------------------------------------------
+# Parameters: Lambda
+# --------------------------------------------------
+
+  pBucketColumns:
+    Type: String
+    Default: "['subreddit']"
+    Description: Lambda - environment variable, the columns you'd like to bucket your data by. this occurs during lambda ETL
+
+  pBucketCount:
+    Type: String
+    Default: 2
+    Description: Lambda - environment variable, the number of buckets (files) you'd like to organize your data in
+
+  pEncryptionOption:
+    Type: String
+    Default: SSE_S3
+    Description: Lambda - environment variable, the type of encryption you'd like for your optimized data
+
+  pPartitions:
+    Type: String
+    Default: "['comment_year', 'comment_month', 'comment_day']"
+    Description: Lambda - environment variable, the columns you'd like to partition your data by.  (must be the last columns in your schema and in the specific order)
+
+  pSortColumns:
+    Type: String
+    Default: "['sentiment_score', 'total_words']"
+    Description: Lambda - environment variable, the columns you'd like to sort your data by.
+
+  pLambdaRate:
+    Description: >
+      Lambda - The rate (frequency) that determines when CloudWatch Events runs the rule that
+      triggers the Lambda function.
+    Default: rate(1 day)
+    AllowedValues:
+      - rate(1 minute)
+      - rate(1 hour)
+      - rate(1 day)
+    Type: String
+
+Conditions:
+  IncludeDevEndpoint: !Equals [ !Ref pIncludeDevEndpoint, true ]
+
+Resources:
+
+# --------------------------------------------------
+# Resources: IAM Policy
+# --------------------------------------------------
+
+  rDataOptimizerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - athena:*
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - s3:*
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref pS3BucketSourceData
+                - /*
+          - Effect: Allow
+            Action:
+              - s3:*
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref pS3GlueTempBucket
+          - Effect: Allow
+            Action:
+              - s3:*
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref pS3BucketArtifacts
+                - /*
+
+# --------------------------------------------------
+# Resources: Glue
+# --------------------------------------------------
+
+  rGlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - !Ref rDataOptimizerPolicy
+
+  rGlueCrawlerSource:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Role:
+        !GetAtt rGlueRole.Arn
+      DatabaseName: !Ref pGlueDBName
+      Targets:
+        S3Targets:
+          - Path: !Join
+              - ''
+              - - s3://
+                - !Ref pS3BucketSourceData
+                - /
+                - raw_comments
+                - /
+      Schedule:
+        ScheduleExpression: "cron(00 12 * * ? *)"
+
+  rGlueCrawlerOptimized:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Role:
+        !GetAtt rGlueRole.Arn
+      DatabaseName: !Ref pGlueDBName
+      Targets:
+        S3Targets:
+          - Path: !Join
+              - ''
+              - - s3://
+                - !Ref pS3BucketSourceData
+                - /
+                - glue_job_optimized
+                - /
+      Schedule:
+        ScheduleExpression: "cron(00 12 * * ? *)"
+
+  rGlueJobFullOptimize:
+      Type: "AWS::Glue::Job"
+      Properties:
+          AllocatedCapacity: 1
+          ExecutionProperty:
+              MaxConcurrentRuns: 1
+          Command:
+              Name: "glueetl"
+              ScriptLocation:  !Sub "s3://${pS3BucketArtifacts}/full-optimizer.py"
+          MaxRetries: 0
+          Name: "full_optimizer"
+          Role: !Ref rGlueRole
+          DefaultArguments:
+            "--job-bookmark-option": "job-bookmark-disable"
+            "--TempDir": !Sub "s3://${pS3GlueTempBucket}/"
+            "--s3_bucket": !Ref pS3BucketSourceData
+
+  rGlueJobDailyOptimize:
+    Type: "AWS::Glue::Job"
+    Properties:
+        AllocatedCapacity: 1
+        ExecutionProperty:
+            MaxConcurrentRuns: 1
+        Command:
+            Name: "glueetl"
+            ScriptLocation: !Sub "s3://${pS3BucketArtifacts}/daily-optimizer.py"
+        MaxRetries: 0
+        Name: "daily_optimizer"
+        Role: !Ref rGlueRole
+        DefaultArguments:
+          "--job-bookmark-option": "job-bookmark-disable"
+          "--TempDir": !Sub "s3://${pS3GlueTempBucket}/"
+          "--s3_bucket": !Ref pS3BucketSourceData
+
+  # glue trigger assigned to glue jobs - status activated
+  rDailyJobTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Type: SCHEDULED
+      Description: DESCRIPTION_SCHEDULED
+      Schedule: cron(00 7 * * ? *)
+      Actions:
+        - JobName: !Ref rGlueJobDailyOptimize
+          Arguments:
+            '--job-bookmark-option': job-bookmark-enable
+      Name: daily-trigger
+
+  # glue dev end point
+  rGlueDevEndpoint:
+    Type: AWS::Glue::DevEndpoint
+    Condition: IncludeDevEndpoint
+    Properties:
+        RoleArn: !Ref rGlueRole
+        EndpointName: "optimizer-testing-endpoint"
+        NumberOfNodes: 2
+
+
+# --------------------------------------------------
+# Resources: Lambda
+# --------------------------------------------------
+
+  rLambdaETLRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - !Ref rDataOptimizerPolicy
+
+  rLambdaAthenaETL:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri:
+        Bucket: !Ref pS3BucketArtifacts
+        Key: athena-etl.zip
+      Timeout: 300
+      MemorySize : 128
+      Description: Perform ETL data optimization on smaller datasets
+      FunctionName: athena-etl
+      Handler: athena-etl.lambda_handler
+      Role: !GetAtt rLambdaETLRole.Arn
+      Runtime: python3.7
+      Environment:
+        Variables:
+          BUCKET_COLUMNS: !Ref pBucketColumns
+          BUCKET_COUNT: !Ref pBucketCount
+          ENCRYPTION_OPTION: !Ref pEncryptionOption
+          GLUE_DATABASE: !Ref pGlueDBName
+          GLUE_SOURCE_TABLE: !Ref pGlueDBSourceTable
+          OUTPUT_S3_BUCKET: !Ref pS3BucketSourceData
+          PARTITIONS: !Ref pPartitions
+          SORT_COLUMNS: !Ref pSortColumns
+
+  rLambdaSchedule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: >
+        A schedule for the Lambda function..
+      ScheduleExpression: !Ref pLambdaRate
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt rLambdaAthenaETL.Arn
+          Id: rLambdaSchedule
+
+  rPermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rLambdaAthenaETL
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt rLambdaSchedule.Arn
+
+
+Outputs:
+
+  oGlueJobDailyOptimize:
+    Description: Name of S3 bucket
+    Value:
+      !Ref rGlueJobDailyOptimize
+    Export:
+      Name: !Sub "${AWS::StackName}-oGlueJobDailyOptimize"
+
+  oGlueJobFullOptimize:
+    Description: Name of S3 bucket
+    Value:
+      !Ref rGlueJobFullOptimize
+    Export:
+      Name: !Sub "${AWS::StackName}-oGlueJobFullOptimize"
+
+  oGlueCrawlerOptimized:
+    Description: Name of S3 bucket
+    Value:
+      !Ref rGlueCrawlerOptimized
+    Export:
+      Name: !Sub "${AWS::StackName}-oGlueCrawlerOptimized"
+
+  oLambdaAthenaETL:
+    Description: Name of S3 bucket
+    Value:
+      !Ref rLambdaAthenaETL
+    Export:
+      Name: !Sub "${AWS::StackName}-oLambdaAthenaETL"
+
+  oGlueDevEndpoint:
+    Condition: IncludeDevEndpoint
+    Description: Name of S3 bucket
+    Value:
+      !Ref rGlueDevEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-oGlueDevEndpoint"
+
