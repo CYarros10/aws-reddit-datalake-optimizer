@@ -19,7 +19,7 @@ s3_bucket = str(args['s3_bucket'])
 glueContext = GlueContext(SparkContext.getOrCreate())
 
 # Create Glue Dynamic Frame
-comments_dynaFrame = glueContext.create_dynamic_frame.from_catalog(database = "reddit_db", table_name = "raw_comments")
+comments_dynaFrame = glueContext.create_dynamic_frame.from_catalog(database = "reddit_db", table_name = "reddit_comments")
 
 # convert to spark data frame
 comments_dataFrame = comments_dynaFrame.toDF()
